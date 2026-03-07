@@ -2,36 +2,39 @@ package engine
 
 import (
 	"AIDS/config"
+	"bufio"
 	"bytes"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"gocv.io/x/gocv"
 	"image"
 	"image/color"
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
+
+	log "github.com/sirupsen/logrus"
+	"gocv.io/x/gocv"
 )
 
 type Detection struct {
-	Box       image.Rectangle
-	Label     string
-	Timestamp time.Time
+	Box        image.Rectangle
+	Label      string
+	Timestamp  time.Time
 	Confidence float32
 }
 
 type Detector struct {
-	net              gocv.Net
-	outputNames      []string
-	footage          *gocv.VideoCapture
-	window           *gocv.Window
-	classes          []string
-	config           *config.Config
-	lastDetections   map[string]time.Time // Track last detection timestamp for each class
+	net               gocv.Net
+	outputNames       []string
+	footage           *gocv.VideoCapture
+	window            *gocv.Window
+	classes           []string
+	config            *config.Config
+	lastDetections    map[string]time.Time // Track last detection timestamp for each class
 	detectionCooldown time.Duration        // Minimum time between logging same detection
-	trackingBoxes    []Detection           // Track detected boxes to keep visible for 1 second
-	animalFilter     map[string]bool       // Only show animals, filter out person/train/bench/etc
+	trackingBoxes     []Detection          // Track detected boxes to keep visible for 1 second
+	animalFilter      map[string]bool      // Only show animals, filter out person/train/bench/etc
 }
 
 func InitializeDetector(config *config.Config) *Detector {
@@ -41,15 +44,15 @@ func InitializeDetector(config *config.Config) *Detector {
 		detectionCooldown: 2 * time.Second,
 		trackingBoxes:     []Detection{},
 		animalFilter: map[string]bool{
-			"cat":       true,
-			"dog":       true,
-			"horse":     true,
-			"sheep":     true,
-			"cow":       true,
-			"elephant":  true,
-			"bear":      true,
-			"zebra":     true,
-			"giraffe":   true,
+			"cat":        true,
+			"dog":        true,
+			"horse":      true,
+			"sheep":      true,
+			"cow":        true,
+			"elephant":   true,
+			"bear":       true,
+			"zebra":      true,
+			"giraffe":    true,
 			"teddy bear": true,
 		},
 	}
@@ -76,6 +79,8 @@ func (d *Detector) Load() error {
 	d.window = gocv.NewWindow("Animal Intrusion Detection System")
 
 	d.classes = readCOCO(d.config.Classnames)
+	log.Infof("Loaded %d classes", len(d.classes))
+	log.Infof("Class index dog=%d cow=%d", indexOf(d.classes, "dog"), indexOf(d.classes, "cow"))
 
 	return nil
 }
@@ -84,7 +89,7 @@ func (d *Detector) Process() {
 
 	mat := gocv.NewMat()
 	frameCount := 0
-	skipFrames := 2  // Process every 3rd frame for real-time performance (skip 2 frames)
+	skipFrames := 2 // Process every 3rd frame for real-time performance (skip 2 frames)
 
 	for {
 		isTrue := d.footage.Read(&mat)
@@ -95,20 +100,20 @@ func (d *Detector) Process() {
 
 		if isTrue {
 			frameCount++
-			
+
 			// Skip frames for real-time performance (process every 3rd frame)
 			if frameCount%int(skipFrames+1) == 0 {
 				frame, detectedClasses, boxes := detect(&d.net, mat.Clone(), d.config.ScoreThreshold,
 					d.config.NmsThreshold, d.outputNames, d.classes, d.animalFilter)
-				
+
 				// Update tracking boxes with new detections
 				d.trackingBoxes = append(d.trackingBoxes, boxes...)
-				
+
 				// Log detections only once per cooldown period to prevent spam
 				if len(detectedClasses) > 0 {
 					d.logUniqueDections(detectedClasses, frameCount)
 				}
-				
+
 				d.window.IMShow(frame)
 			} else {
 				// Display frame with tracked boxes from previous detection
@@ -116,7 +121,7 @@ func (d *Detector) Process() {
 				d.drawTrackedBoxes(&displayFrame)
 				d.window.IMShow(displayFrame)
 			}
-			
+
 			key := d.window.WaitKey(1)
 			if key == 113 {
 				break
@@ -163,15 +168,15 @@ func (d *Detector) sendMobileAlert(animal string, frameCount int) {
 		timestamp := time.Now().Format("2006-01-02 15:04:05")
 		// Create message without escape sequences
 		message := fmt.Sprintf("[ELEPHANT ALERT] %s detected at Frame %d | Time: %s", animal, frameCount, timestamp)
-		
+
 		// Using ntfy.sh for free push notifications
 		// User must subscribe: https://ntfy.sh/aids_alerts
 		url := "https://ntfy.sh/aids_alerts"
-		
+
 		req, _ := http.NewRequest("POST", url, bytes.NewBufferString(message))
 		req.Header.Set("Title", fmt.Sprintf("[ALERT] %s Detected!", animal))
 		req.Header.Set("Priority", "high")
-		
+
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
@@ -179,7 +184,7 @@ func (d *Detector) sendMobileAlert(animal string, frameCount int) {
 			return
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode == 200 {
 			log.Infof("✅ Mobile notification sent: %s", animal)
 		} else {
@@ -192,24 +197,24 @@ func (d *Detector) sendMobileAlert(animal string, frameCount int) {
 func (d *Detector) drawTrackedBoxes(img *gocv.Mat) {
 	now := time.Now()
 	const boxVisibilityDuration = 1 * time.Second // Keep boxes visible for 1 second
-	
+
 	for _, detection := range d.trackingBoxes {
 		// Only draw if box is still within visibility window
 		if now.Sub(detection.Timestamp) < boxVisibilityDuration {
 			// Draw colored rectangle
 			gocv.Rectangle(img, detection.Box, color.RGBA{0, 255, 0, 0}, 2)
-			
+
 			// Draw label background
-			labelBox := image.Rect(detection.Box.Min.X, detection.Box.Min.Y-25, 
+			labelBox := image.Rect(detection.Box.Min.X, detection.Box.Min.Y-25,
 				detection.Box.Min.X+120, detection.Box.Min.Y-5)
 			gocv.Rectangle(img, labelBox, color.RGBA{0, 255, 0, 0}, -1)
-			
+
 			// Draw text
-			gocv.PutText(img, detection.Label, image.Point{detection.Box.Min.X + 3, detection.Box.Min.Y - 8}, 
+			gocv.PutText(img, detection.Label, image.Point{detection.Box.Min.X + 3, detection.Box.Min.Y - 8},
 				gocv.FontHersheySimplex, 0.6, color.RGBA{0, 0, 0, 0}, 1)
 		}
 	}
-	
+
 	// Clean up old boxes
 	var activeBoxes []Detection
 	for _, detection := range d.trackingBoxes {
@@ -226,7 +231,7 @@ func detect(net *gocv.Net, src gocv.Mat, scoreThreshold float32, nmsThreshold fl
 	blob := gocv.BlobFromImage(img, 1/255.0, image.Pt(416, 416), gocv.NewScalar(0, 0, 0, 0), true, false)
 	net.SetInput(blob, "")
 	probs := net.ForwardLayers(OutputNames)
-	boxes, confidences, classIds := postProcess(img, &probs, classes, animalFilter)
+	boxes, confidences, classIds := postProcess(img, &probs, classes, animalFilter, scoreThreshold)
 	indices := make([]int, 100)
 	if len(boxes) == 0 { // No Classes
 		return src, []string{}, []Detection{}
@@ -236,7 +241,7 @@ func detect(net *gocv.Net, src gocv.Mat, scoreThreshold float32, nmsThreshold fl
 	return drawRect(src, boxes, classes, classIds, indices)
 }
 
-func postProcess(frame gocv.Mat, outs *[]gocv.Mat, classes []string, animalFilter map[string]bool) ([]image.Rectangle, []float32, []int) {
+func postProcess(frame gocv.Mat, outs *[]gocv.Mat, classes []string, animalFilter map[string]bool, scoreThreshold float32) ([]image.Rectangle, []float32, []int) {
 	var classIds []int
 	var confidences []float32
 	var boxes []image.Rectangle
@@ -248,9 +253,10 @@ func postProcess(frame gocv.Mat, outs *[]gocv.Mat, classes []string, animalFilte
 			scoresCol := out.RowRange(i, i+1)
 
 			scores := scoresCol.ColRange(5, out.Cols())
-			_, confidence, _, classIDPoint := gocv.MinMaxLoc(scores)
-			// Lowered threshold to 0.35 for better elephant detection in night vision
-			if confidence > 0.35 && classIDPoint.X >= 0 && classIDPoint.X < len(classes) {
+			_, classConfidence, _, classIDPoint := gocv.MinMaxLoc(scores)
+			objectness := data[4]
+			confidence := float32(classConfidence) * objectness
+			if confidence > scoreThreshold && classIDPoint.X >= 0 && classIDPoint.X < len(classes) {
 				classLabel := classes[classIDPoint.X]
 				if animalFilter[classLabel] { // Only include if it's an animal
 					centerX := int(data[0] * float32(frame.Cols()))
@@ -276,39 +282,42 @@ func drawRect(img gocv.Mat, boxes []image.Rectangle, classes []string, classIds 
 	var detectClass []string
 	var detections []Detection
 	now := time.Now()
-	
+
 	for _, idx := range indices {
 		if idx == 0 || idx >= len(boxes) {
 			continue
 		}
-		
+
 		// Get box coordinates
 		x := boxes[idx].Min.X
 		y := boxes[idx].Min.Y
 		w := boxes[idx].Max.X
 		h := boxes[idx].Max.Y
-		
+
 		// Get label
 		if classIds[idx] >= 0 && classIds[idx] < len(classes) {
 			label := classes[classIds[idx]]
-			
+			if label == "dog" || label == "cow" {
+				log.Infof("Detection classId=%d label=%s", classIds[idx], label)
+			}
+
 			// For this elephant detection system: convert horses to elephants
 			// Since elephants are often misclassified as horses by YOLO, especially at distance
 			if label == "horse" {
 				label = "elephant"
 			}
-			
+
 			// Draw colored rectangle
 			gocv.Rectangle(&img, image.Rect(x, y, w, h), color.RGBA{0, 255, 0, 0}, 2)
-			
+
 			// Draw label background (filled rectangle)
 			gocv.Rectangle(&img, image.Rect(x, y-25, x+120, y-5), color.RGBA{0, 255, 0, 0}, -1)
-			
+
 			// Draw text (label name in black)
 			gocv.PutText(&img, label, image.Point{x + 3, y - 8}, gocv.FontHersheySimplex, 0.6, color.RGBA{0, 0, 0, 0}, 1)
-			
+
 			detectClass = append(detectClass, label)
-			
+
 			// Track detection for persistence (visible for 1 second)
 			detections = append(detections, Detection{
 				Box:       image.Rect(x, y, w, h),
@@ -336,13 +345,23 @@ func readCOCO(path string) []string {
 	var classes []string
 	read, _ := os.Open(path)
 	defer read.Close()
-	for {
-		var t string
-		_, err := fmt.Fscan(read, &t)
-		if err != nil {
-			break
+
+	scanner := bufio.NewScanner(read)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
 		}
-		classes = append(classes, t)
+		classes = append(classes, line)
 	}
 	return classes
+}
+
+func indexOf(classes []string, target string) int {
+	for i, c := range classes {
+		if c == target {
+			return i
+		}
+	}
+	return -1
 }
