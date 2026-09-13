@@ -3,11 +3,11 @@ package engine
 import (
 	"AIDS/config"
 	"bufio"
-	"bytes"
 	"fmt"
 	"image"
 	"image/color"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -33,15 +33,30 @@ type Detector struct {
 	config            *config.Config
 	lastDetections    map[string]time.Time // Track last detection timestamp for each class
 	detectionCooldown time.Duration        // Minimum time between logging same detection
+	lastNotifications map[string]time.Time // Track last notification timestamp for each class
+	notifyCooldown    time.Duration        // Minimum time between notifications for same class
 	trackingBoxes     []Detection          // Track detected boxes to keep visible for 1 second
 	animalFilter      map[string]bool      // Only show animals, filter out person/train/bench/etc
+	telegramWarned    bool                 // Avoid repeating setup warnings when Telegram config is missing
 }
 
 func InitializeDetector(config *config.Config) *Detector {
+	detectionCooldown := 2 * time.Second
+	if config.DetectionLogCooldownMilli > 0 {
+		detectionCooldown = time.Duration(config.DetectionLogCooldownMilli) * time.Millisecond
+	}
+
+	notifyCooldown := 30 * time.Second
+	if config.NotificationCooldownSec > 0 {
+		notifyCooldown = time.Duration(config.NotificationCooldownSec) * time.Second
+	}
+
 	return &Detector{
 		config:            config,
 		lastDetections:    make(map[string]time.Time),
-		detectionCooldown: 2 * time.Second,
+		detectionCooldown: detectionCooldown,
+		lastNotifications: make(map[string]time.Time),
+		notifyCooldown:    notifyCooldown,
 		trackingBoxes:     []Detection{},
 		animalFilter: map[string]bool{
 			"cat":        true,
@@ -88,48 +103,69 @@ func (d *Detector) Load() error {
 func (d *Detector) Process() {
 
 	mat := gocv.NewMat()
+	defer mat.Close()
+
 	frameCount := 0
-	skipFrames := 2 // Process every 3rd frame for real-time performance (skip 2 frames)
+	skipFrames := 2 // Default: process every 3rd frame
+	if d.config.FrameSkip > 0 {
+		skipFrames = d.config.FrameSkip
+	}
 
 	for {
-		isTrue := d.footage.Read(&mat)
+		shouldStop := false
+		feedEnded := false
 
-		if mat.Empty() {
-			continue
-		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Errorf("Recovered from frame processing panic: %v", r)
+				}
+			}()
 
-		if isTrue {
-			frameCount++
+			isTrue := d.footage.Read(&mat)
 
-			// Skip frames for real-time performance (process every 3rd frame)
-			if frameCount%int(skipFrames+1) == 0 {
-				frame, detectedClasses, boxes := detect(&d.net, mat.Clone(), d.config.ScoreThreshold,
-					d.config.NmsThreshold, d.outputNames, d.classes, d.animalFilter)
+			if mat.Empty() {
+				return
+			}
 
-				// Update tracking boxes with new detections
-				d.trackingBoxes = append(d.trackingBoxes, boxes...)
+			if isTrue {
+				frameCount++
 
-				// Log detections only once per cooldown period to prevent spam
-				if len(detectedClasses) > 0 {
-					d.logUniqueDections(detectedClasses, frameCount)
+				// Skip frames for real-time performance (process every 3rd frame)
+				if frameCount%int(skipFrames+1) == 0 {
+					frame, detectedClasses, boxes := detect(&d.net, mat.Clone(), d.config.ScoreThreshold,
+						d.config.NmsThreshold, d.outputNames, d.classes, d.animalFilter)
+					defer frame.Close()
+
+					// Update tracking boxes with new detections
+					d.trackingBoxes = append(d.trackingBoxes, boxes...)
+
+					// Log detections only once per cooldown period to prevent spam
+					if len(detectedClasses) > 0 {
+						d.logUniqueDections(detectedClasses, frameCount)
+					}
+
+					d.window.IMShow(frame)
+				} else {
+					// Display frame with tracked boxes from previous detection
+					displayFrame := mat.Clone()
+					defer displayFrame.Close()
+					d.drawTrackedBoxes(&displayFrame)
+					d.window.IMShow(displayFrame)
 				}
 
-				d.window.IMShow(frame)
+				key := d.window.WaitKey(1)
+				if key == 113 {
+					shouldStop = true
+				}
 			} else {
-				// Display frame with tracked boxes from previous detection
-				displayFrame := mat.Clone()
-				d.drawTrackedBoxes(&displayFrame)
-				d.window.IMShow(displayFrame)
+				feedEnded = true
 			}
+		}()
 
-			key := d.window.WaitKey(1)
-			if key == 113 {
-				break
-			}
-		} else {
+		if shouldStop || feedEnded {
 			return
 		}
-
 	}
 }
 
@@ -150,8 +186,8 @@ func (d *Detector) logUniqueDections(detectedClasses []string, frameCount int) {
 			d.lastDetections[class] = now
 			// Trigger alert sound on new detection
 			d.playAlert()
-			// Send mobile push notification
-			d.sendMobileAlert(class, frameCount)
+			// Send Telegram notification with stronger per-animal cooldown
+			d.sendTelegramAlert(class, frameCount, now)
 		}
 	}
 }
@@ -162,33 +198,55 @@ func (d *Detector) playAlert() {
 	}()
 }
 
-// sendMobileAlert sends push notification to mobile device via ntfy.sh
-func (d *Detector) sendMobileAlert(animal string, frameCount int) {
+// sendTelegramAlert sends notification to Telegram chat using Bot API.
+func (d *Detector) sendTelegramAlert(animal string, frameCount int, now time.Time) {
+	if !d.config.EnableTelegram {
+		return
+	}
+
+	lastNotification, exists := d.lastNotifications[animal]
+	if exists && now.Sub(lastNotification) < d.notifyCooldown {
+		return
+	}
+	d.lastNotifications[animal] = now
+
+	if d.config.TelegramBotToken == "" || d.config.TelegramChatID == "" {
+		if !d.telegramWarned {
+			log.Warn("Telegram enabled but not configured: set telegramBotToken and telegramChatId in config/aids.cfg")
+			d.telegramWarned = true
+		}
+		return
+	}
+
 	go func() {
 		timestamp := time.Now().Format("2006-01-02 15:04:05")
-		// Create message without escape sequences
-		message := fmt.Sprintf("[ELEPHANT ALERT] %s detected at Frame %d | Time: %s", animal, frameCount, timestamp)
+		message := fmt.Sprintf("AIDS Alert: %s detected at frame %d (%s)", animal, frameCount, timestamp)
+		botURL := fmt.Sprintf("https://api.telegram.org/bot%s/sendMessage", d.config.TelegramBotToken)
+		form := url.Values{
+			"chat_id":    {d.config.TelegramChatID},
+			"text":       {message},
+			"parse_mode": {"HTML"},
+		}
 
-		// Using ntfy.sh for free push notifications
-		// User must subscribe: https://ntfy.sh/aids_alerts
-		url := "https://ntfy.sh/aids_alerts"
-
-		req, _ := http.NewRequest("POST", url, bytes.NewBufferString(message))
-		req.Header.Set("Title", fmt.Sprintf("[ALERT] %s Detected!", animal))
-		req.Header.Set("Priority", "high")
+		req, err := http.NewRequest("POST", botURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			log.Warnf("Telegram request creation failed: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 		client := &http.Client{Timeout: 10 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Warnf("❌ Mobile alert failed: %v", err)
+			log.Warnf("Telegram alert failed: %v", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode == 200 {
-			log.Infof("✅ Mobile notification sent: %s", animal)
+			log.Infof("Telegram notification sent: %s", animal)
 		} else {
-			log.Warnf("⚠️ Notification API returned: %d", resp.StatusCode)
+			log.Warnf("Telegram API returned status: %d", resp.StatusCode)
 		}
 	}()
 }
@@ -227,14 +285,27 @@ func (d *Detector) drawTrackedBoxes(img *gocv.Mat) {
 
 func detect(net *gocv.Net, src gocv.Mat, scoreThreshold float32, nmsThreshold float32, OutputNames []string, classes []string, animalFilter map[string]bool) (gocv.Mat, []string, []Detection) {
 	img := src.Clone()
+	defer img.Close()
+
 	img.ConvertTo(&img, gocv.MatTypeCV32F)
 	blob := gocv.BlobFromImage(img, 1/255.0, image.Pt(416, 416), gocv.NewScalar(0, 0, 0, 0), true, false)
+	defer blob.Close()
+
 	net.SetInput(blob, "")
 	probs := net.ForwardLayers(OutputNames)
+	defer func() {
+		for i := range probs {
+			probs[i].Close()
+		}
+	}()
+
 	boxes, confidences, classIds := postProcess(img, &probs, classes, animalFilter, scoreThreshold)
-	indices := make([]int, 100)
 	if len(boxes) == 0 { // No Classes
 		return src, []string{}, []Detection{}
+	}
+	indices := make([]int, len(boxes))
+	for i := range indices {
+		indices[i] = -1
 	}
 	gocv.NMSBoxes(boxes, confidences, scoreThreshold, nmsThreshold, indices)
 
@@ -284,7 +355,7 @@ func drawRect(img gocv.Mat, boxes []image.Rectangle, classes []string, classIds 
 	now := time.Now()
 
 	for _, idx := range indices {
-		if idx == 0 || idx >= len(boxes) {
+		if idx < 0 || idx >= len(boxes) || idx >= len(classIds) {
 			continue
 		}
 
